@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# ISO downloads, extraction spikes, backups: never commit
+work/
+*.iso
+*.squashfs
+orin-backup/

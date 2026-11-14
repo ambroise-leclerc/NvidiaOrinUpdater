@@ -1,0 +1,26 @@
+[Unit]
+Description=orin-updater: restore user account from backup (first boot)
+Documentation=https://github.com/ambroise-leclerc/NvidiaOrinUpdater
+ConditionPathExists=/var/lib/orin-updater/pending
+ConditionKernelCommandLine=!boot=casper
+# Display modules first, so the passphrase prompt is visible on the monitor.
+After=local-fs.target systemd-udevd.service nv-load-display-modules.service
+# Run before NVIDIA's first-boot setup (JetPack 7: nv-oobe, JetPack 6: nv-oem-config)
+# and before the login screen.
+Before=nv-oobe.service nv-oem-config.service nv-oem-config-gui.service display-manager.service gdm.service getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/orin-updater/orin_restore.py --firstboot
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TimeoutStartSec=infinity
+# A failed restore must not block the boot: NVIDIA's setup then runs as usual.
+SuccessExitStatus=1
+
+[Install]
+WantedBy=nv-oobe.target nv-oem-config.target graphical.target multi-user.target

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run orin-updater straight from the checkout (works with sudo, no install needed).
+PYTHONPATH="$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m orin_updater "$@"

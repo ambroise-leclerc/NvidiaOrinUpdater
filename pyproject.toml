@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orin-updater"
+dynamic = ["version"]
+description = "Upgrade a Jetson Orin from JetPack 6 to JetPack 7 without losing your user account"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=5.4"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Installation/Setup",
+]
+
+[project.urls]
+Homepage = "https://github.com/ambroise-leclerc/NvidiaOrinUpdater"
+
+[project.scripts]
+orin-updater = "orin_updater.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "orin_updater.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["orin_updater*"]
+
+[tool.setuptools.package-data]
+orin_updater = ["target/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["work", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["UP007"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
