@@ -42,3 +42,4 @@ ignore = ["UP007"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
