@@ -368,3 +368,133 @@ def test_late_command_never_breaks_install(tmp_path):
     assert subprocess.run(["sh", str(script), str(target)]).returncode == 0
     assert not (target / "var/lib/orin-updater/pending").exists()
     assert "FAILED" in (target / "var/log/orin-updater-install.log").read_text()
+
+
+# --------------------------------------------------------------------------- incomplete backups
+
+def _fake_parts(out: Path, sizes=(10, 20)) -> dict:
+    """A manifest + parts that never touched gpg: enough to exercise verify_backup_dir."""
+    import hashlib
+    import json
+
+    def part(name, n):
+        data = os.urandom(n)
+        (out / name).write_bytes(data)
+        return {"file": name, "size": n, "sha256": hashlib.sha256(data).hexdigest()}
+
+    manifest = {"system_archive": part("system.tar.zst.gpg", 5),
+                "home_parts": [part(f"home.tar.zst.gpg.{i:03d}", n) for i, n in enumerate(sizes)]}
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    return manifest
+
+
+def test_verify_backup_dir(tmp_path):
+    from orin_updater.backup import verify_backup_dir
+    log = lambda *_: None  # noqa: E731
+    assert "no manifest.json" in verify_backup_dir(tmp_path, log)[0]
+
+    manifest = _fake_parts(tmp_path)
+    assert verify_backup_dir(tmp_path, log) == []
+
+    (tmp_path / "INCOMPLETE").write_text("x")
+    assert "INCOMPLETE" in verify_backup_dir(tmp_path, log)[0]
+    (tmp_path / "INCOMPLETE").unlink()
+
+    part1 = tmp_path / manifest["home_parts"][1]["file"]
+    data = bytearray(part1.read_bytes())
+    data[3] ^= 0xFF
+    part1.write_bytes(bytes(data))
+    assert "sha256 mismatch" in verify_backup_dir(tmp_path, log)[0]
+
+    part1.write_bytes(b"short")  # truncated, like a part cut by a crash
+    assert "size" in verify_backup_dir(tmp_path, log)[0]
+    part1.unlink()
+    assert "missing" in verify_backup_dir(tmp_path, log)[0]
+
+
+def test_discard_incomplete_only_when_marked(tmp_path):
+    from orin_updater.backup import discard_incomplete
+    (tmp_path / "home.tar.zst.gpg.000").write_bytes(b"partial")
+    (tmp_path / "notes.txt").write_text("not ours")
+    assert discard_incomplete(tmp_path, lambda *_: None) is False  # no marker: hands off
+    assert (tmp_path / "home.tar.zst.gpg.000").exists()
+
+    (tmp_path / "INCOMPLETE").write_text("x")
+    assert discard_incomplete(tmp_path, lambda *_: None) is True
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt"]
+
+
+def test_find_backup_refuses_incomplete(restore_mod, tmp_path):
+    d = tmp_path / "orin-backup"
+    d.mkdir()
+    (d / "manifest.json").write_text("{}")
+    (d / "INCOMPLETE").write_text("x")
+    with pytest.raises(restore_mod.RestoreError, match="INCOMPLETE"):
+        restore_mod.find_backup(str(d))
+    (d / "INCOMPLETE").unlink()
+    assert restore_mod.find_backup(str(d)) == d
+
+
+@needs_tools
+def test_encrypt_stream_reports_progress(tmp_path):
+    from orin_updater.backup import encrypt_stream
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "blob").write_bytes(os.urandom(2_500_000))
+    (tmp_path / "out").mkdir()
+    (tmp_path / "work").mkdir()
+    seen = []
+    encrypt_stream(["tar", "-C", str(tmp_path / "src"), "-cpf", "-", "."],
+                   tmp_path / "out" / "home.", "pw", tmp_path / "work", chunk_size=None,
+                   progress=seen.append)
+    assert seen and seen == sorted(seen) and seen[-1] >= 2_500_000
+
+
+@pytest.fixture
+def fake_run_backup(monkeypatch, tmp_path):
+    """run_backup against a fake root: no real user, no real /etc, home tarred from tmp."""
+    from orin_updater import backup
+    root = tmp_path / "root"
+    (root / "home/bob").mkdir(parents=True)
+    (root / "home/bob/file").write_text("hello")
+    ident = backup.Identity("bob", 1000, 1000, "bob", "", "/home/bob", "/bin/bash", "$6$x")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(backup, "collect_identity", lambda user: ident)
+    monkeypatch.setattr(backup, "TAR_CREATE", ["tar", "-C", str(root), "-cpf", "-"])
+
+    def stage(stage_dir, ident, cfg):
+        (stage_dir / "orin-updater").mkdir(parents=True)
+        (stage_dir / "orin-updater" / "identity.json").write_text("{}")
+        return []
+
+    monkeypatch.setattr(backup, "stage_system", stage)
+    return backup
+
+
+@needs_tools
+def test_run_backup_marker_lifecycle(fake_run_backup, tmp_path, monkeypatch):
+    backup = fake_run_backup
+    out = tmp_path / "out"
+    log = lambda *_: None  # noqa: E731
+
+    # 1. a crash during the home archive leaves the marker and no manifest
+    real = backup.encrypt_stream
+
+    def crash_on_home(cmd, out_prefix, *a, **kw):
+        if out_prefix.name.startswith("home"):
+            (out_prefix.parent / "home.tar.zst.gpg.000").write_bytes(b"partial")
+            raise backup.BackupError("simulated freeze")
+        return real(cmd, out_prefix, *a, **kw)
+
+    monkeypatch.setattr(backup, "encrypt_stream", crash_on_home)
+    with pytest.raises(backup.BackupError, match="simulated"):
+        backup.run_backup("bob", out, "passphrase", backup.Config(), log=log)
+    assert (out / "INCOMPLETE").exists()
+    assert not (out / "manifest.json").exists()
+    assert backup.verify_backup_dir(out, log)  # reported as unusable
+
+    # 2. a rerun discards the debris, finishes, and only then removes the marker
+    monkeypatch.setattr(backup, "encrypt_stream", real)
+    backup.run_backup("bob", out, "passphrase", backup.Config(), log=log)
+    assert not (out / "INCOMPLETE").exists()
+    assert (out / "manifest.json").exists() and (out / "SHA256SUMS").exists()
+    assert backup.verify_backup_dir(out, log) == []

@@ -1,6 +1,8 @@
 """Encrypted backup of a user account, its home and selected system configuration.
 
 Output directory layout (see __init__ constants):
+    INCOMPLETE                present while a backup is being written; removed only once the
+                              manifest is written and the archives are verified
     manifest.json             plaintext, non-sensitive: who/what/where + sha256 of every part
     system.tar.zst.gpg        identity (incl. password hash), system files, inventory
     home.tar.zst.gpg.000 ...  the home directory, split in parts
@@ -26,7 +28,9 @@ from . import (
     BACKUP_LABEL,
     FORMAT_VERSION,
     HOME_ARCHIVE_PREFIX,
+    INCOMPLETE_NAME,
     MANIFEST_NAME,
+    SUMS_NAME,
     SYSTEM_ARCHIVE,
     __version__,
     inventory,
@@ -120,8 +124,11 @@ def _gpg_env(tmp: Path) -> dict:
 
 
 def encrypt_stream(cmd: list[str], out_prefix: Path, passphrase: str, tmp: Path,
-                   chunk_size: int | None, ok_codes=(0,)) -> list[dict]:
+                   chunk_size: int | None, ok_codes=(0,), progress=None) -> list[dict]:
     """Run `cmd | zstd | gpg` and write the ciphertext to one file or numbered parts.
+
+    Every finished part is fsync'ed. `progress(total_bytes_written)` is called after each
+    1 MiB block when given (the caller throttles).
 
     Returns [{"file":..., "size":..., "sha256":...}].
     """
@@ -143,10 +150,13 @@ def encrypt_stream(cmd: list[str], out_prefix: Path, passphrase: str, tmp: Path,
     fh = None
     written = 0
     hasher = None
+    total = 0
 
     def close_part():
         nonlocal fh
         if fh is not None:
+            fh.flush()
+            os.fsync(fh.fileno())
             fh.close()
             parts[-1]["size"] = written
             parts[-1]["sha256"] = hasher.hexdigest()
@@ -157,6 +167,9 @@ def encrypt_stream(cmd: list[str], out_prefix: Path, passphrase: str, tmp: Path,
             block = gpg.stdout.read(1 << 20)
             if not block:
                 break
+            total += len(block)
+            if progress:
+                progress(total)
             view = memoryview(block)
             while view:
                 if fh is None:
@@ -214,14 +227,80 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _fmt_gib(n: float) -> str:
+    return f"{n / 1024**3:.2f} GiB"
+
+
+def make_progress(label: str, log, every: float = 10.0):
+    """Return a throttled progress callback that logs the volume written and the speed."""
+    start = last = time.monotonic()
+
+    def progress(total: int) -> None:
+        nonlocal last
+        now = time.monotonic()
+        if now - last >= every:
+            last = now
+            rate = total / max(now - start, 1e-6) / 1024**2
+            log(f"  {label}: {_fmt_gib(total)} written ({rate:.0f} MiB/s)")
+
+    return progress
+
+
+def discard_incomplete(out_dir: Path, log=print) -> bool:
+    """Remove what an interrupted run left behind. Only touches files this tool creates,
+    and only when the INCOMPLETE marker proves the previous run never finished."""
+    if not (out_dir / INCOMPLETE_NAME).exists():
+        return False
+    log(f"* Found an unfinished backup in {out_dir} (INCOMPLETE marker): discarding it")
+    for f in [*out_dir.glob(HOME_ARCHIVE_PREFIX + "*"), out_dir / SYSTEM_ARCHIVE,
+              out_dir / MANIFEST_NAME, out_dir / SUMS_NAME, out_dir / INCOMPLETE_NAME]:
+        f.unlink(missing_ok=True)
+    return True
+
+
+def verify_backup_dir(out_dir: Path, log=print) -> list[str]:
+    """Check a finished backup without the passphrase: marker, manifest, sizes, sha256.
+
+    Returns a list of problems (empty = the backup is complete and uncorrupted).
+    """
+    if (out_dir / INCOMPLETE_NAME).exists():
+        return [f"{INCOMPLETE_NAME} marker present: the backup never finished"]
+    mf = out_dir / MANIFEST_NAME
+    if not mf.is_file():
+        return [f"no {MANIFEST_NAME}: the backup never finished"]
+    try:
+        manifest = json.loads(mf.read_text())
+        parts = [manifest["system_archive"], *manifest["home_parts"]]
+    except (ValueError, KeyError) as exc:
+        return [f"unreadable {MANIFEST_NAME}: {exc}"]
+    problems = []
+    for p in parts:
+        f = out_dir / p["file"]
+        if not f.is_file():
+            problems.append(f"{p['file']}: missing")
+        elif f.stat().st_size != p["size"]:
+            problems.append(f"{p['file']}: size {f.stat().st_size} != {p['size']}")
+        else:
+            log(f"  checking {p['file']} ({_fmt_gib(p['size'])}) ...")
+            if sha256_file(f) != p["sha256"]:
+                problems.append(f"{p['file']}: sha256 mismatch")
+    return problems
+
+
 def run_backup(user: str, out_dir: Path, passphrase: str, cfg: Config, verify: bool = True,
                log=print) -> dict:
     if os.geteuid() != 0:
         raise BackupError("the backup must run as root (sudo) to read /etc/shadow and system files")
     out_dir.mkdir(parents=True, exist_ok=True)
+    discard_incomplete(out_dir, log)
     if any(out_dir.glob(HOME_ARCHIVE_PREFIX + "*")) or (out_dir / MANIFEST_NAME).exists():
         raise BackupError(f"{out_dir} already contains a backup; choose an empty directory")
     ident = collect_identity(user)
+    # From here until the very end the directory is marked unusable. A crash, a power cut or
+    # Ctrl-C leaves the marker behind, so nobody mistakes the partial parts for a backup.
+    (out_dir / INCOMPLETE_NAME).write_text(
+        f"backup started {time.strftime('%Y-%m-%dT%H:%M:%S%z')}; not finished or not verified\n")
+    os.sync()
     home_rel = ident.home.strip("/")
     tmp = Path(tempfile.mkdtemp(prefix="orin-updater-"))
     os.chmod(tmp, 0o700)
@@ -239,7 +318,8 @@ def run_backup(user: str, out_dir: Path, passphrase: str, cfg: Config, verify: b
         home_parts = encrypt_stream(
             [*TAR_CREATE, *cfg.tar_excludes(home_rel), home_rel],
             out_dir / HOME_ARCHIVE_PREFIX, passphrase, tmp, chunk_size=cfg.chunk_size,
-            ok_codes=(0, 1))  # tar exits 1 when files changed while being read
+            ok_codes=(0, 1),  # tar exits 1 when files changed while being read
+            progress=make_progress("home", log))
         total = sum(p["size"] for p in home_parts)
         log(f"  {len(home_parts)} part(s), {total / 1024**3:.2f} GiB in {time.time() - t0:.0f}s")
 
@@ -263,7 +343,7 @@ def run_backup(user: str, out_dir: Path, passphrase: str, cfg: Config, verify: b
             "system_items": cfg.system_items,
         }
         (out_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
-        (out_dir / "SHA256SUMS").write_text("".join(
+        (out_dir / SUMS_NAME).write_text("".join(
             f"{p['sha256']}  {p['file']}\n" for p in [*sys_parts, *home_parts]))
 
         if verify:
@@ -271,6 +351,10 @@ def run_backup(user: str, out_dir: Path, passphrase: str, cfg: Config, verify: b
             n = verify_archive([out_dir / SYSTEM_ARCHIVE], passphrase, tmp)
             m = verify_archive([out_dir / p["file"] for p in home_parts], passphrase, tmp)
             log(f"  system: {n} entries, home: {m} entries: OK")
+        # Only now is the backup usable: flush it to the medium, then drop the marker.
+        os.sync()
+        (out_dir / INCOMPLETE_NAME).unlink(missing_ok=True)
+        os.sync()
         return manifest
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

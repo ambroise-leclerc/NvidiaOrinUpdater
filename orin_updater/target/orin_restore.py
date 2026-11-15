@@ -66,6 +66,12 @@ def run(cmd: list[str], check: bool = True, **kw) -> subprocess.CompletedProcess
 
 # --------------------------------------------------------------------------- locate backup
 
+def _refuse_incomplete(d: Path) -> None:
+    # The backup tool drops this marker only after the manifest is written and verified.
+    if (d / "INCOMPLETE").exists():
+        raise RestoreError(f"{d} is marked INCOMPLETE: the backup never finished, not using it")
+
+
 def find_backup(explicit: str | None, wait: int = 60) -> Path:
     if explicit:
         d = Path(explicit)
@@ -73,6 +79,7 @@ def find_backup(explicit: str | None, wait: int = 60) -> Path:
             d = d / BACKUP_DIRNAME
         if not (d / "manifest.json").is_file():
             raise RestoreError(f"no manifest.json in {d}")
+        _refuse_incomplete(d)
         return d
     dev = None
     for _ in range(wait):
@@ -89,6 +96,7 @@ def find_backup(explicit: str | None, wait: int = 60) -> Path:
     d = MOUNTPOINT / BACKUP_DIRNAME
     if not (d / "manifest.json").is_file():
         raise RestoreError(f"{dev} has no {BACKUP_DIRNAME}/manifest.json")
+    _refuse_incomplete(d)
     return d
 
 

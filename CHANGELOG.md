@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+An unfinished backup can no longer pass for a good one. This came from a real run where the
+Jetson froze during `backup --usb`, leaving four partial home parts and no manifest on the key.
+
+- `backup` writes an `INCOMPLETE` marker as soon as it starts and removes it only after the
+  manifest is written and the archives are verified. A crash, a power cut or Ctrl-C leaves it.
+- A rerun on a directory that carries the marker discards the unfinished attempt by itself
+  (it only touches files this tool creates). Without the marker it still refuses a non-empty
+  directory.
+- Every finished part is `fsync`ed, and the medium is synced before the marker is removed.
+- `backup` logs the volume written and the speed every 10 s while archiving the home.
+- New `verify-backup (--usb | --dir DIR)`: checks marker, manifest, size and sha256 of every
+  part without the passphrase. Run it before rebooting into the installer.
+- The restore (first boot or `restore`) refuses a backup directory marked `INCOMPLETE`, even if
+  a `manifest.json` is present.
+- On failure `backup` now says plainly not to start the installation from that key.
+
 ## 0.1.0 — 2026-11-14
 
 First release.

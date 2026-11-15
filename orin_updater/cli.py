@@ -89,14 +89,45 @@ def cmd_backup(args) -> int:
             out = Path(args.out)
         print(f"Backing up {user} to {out}")
         run_backup(user, out, passphrase, cfg, verify=not args.no_verify)
-        print("Backup complete.")
+        print("Backup complete and verified (no INCOMPLETE marker left).")
+        print("Recommended before rebooting: orin-updater verify-backup "
+              + ("--usb" if args.usb else f"--dir {out}"))
         return 0
     except (BackupError, usb.UsbError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print("The backup is INCOMPLETE and will not be used by the restore. Do NOT start the "
+              "installation from this key; fix the problem and run the backup again "
+              "(it discards the unfinished attempt itself).", file=sys.stderr)
+        return 1
+    finally:
+        if mounted:
+            usb.unmount_backup()
+
+
+def cmd_verify_backup(args) -> int:
+    from . import usb
+    from .backup import verify_backup_dir
+    need_root("verify-backup")
+    mounted = False
+    try:
+        if args.usb:
+            out = usb.mount_backup()
+            mounted = True
+        else:
+            out = Path(args.dir)
+        print(f"Checking {out} (sizes and sha256 of every part; no passphrase needed) ...")
+        problems = verify_backup_dir(out)
+    except usb.UsbError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         if mounted:
             usb.unmount_backup()
+    if problems:
+        print("BACKUP NOT USABLE:", *problems, sep="\n  ", file=sys.stderr)
+        return 1
+    print("OK: the backup is complete and every part matches the manifest.")
+    return 0
 
 
 def cmd_fetch_iso(args) -> int:
@@ -203,6 +234,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--passphrase-file", help="read the passphrase from a file (automation)")
     p.add_argument("--no-verify", action="store_true", help="skip the decrypt+list verification")
     p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("verify-backup",
+                       help="check that a backup is complete (marker, manifest, sizes, sha256)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--usb", action="store_true", help=f"the '{BACKUP_LABEL}' partition")
+    src.add_argument("--dir", help="a backup directory")
+    p.set_defaults(func=cmd_verify_backup)
 
     p = sub.add_parser("fetch-iso", help="download NVIDIA's Jetson ISO installer")
     p.add_argument("--release", default="r39.2.1")

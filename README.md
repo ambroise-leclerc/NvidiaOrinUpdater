@@ -67,6 +67,7 @@ lsblk -o NAME,SIZE,TRAN,MODEL              #    find your USB key, e.g. /dev/sda
 sudo ./orin-updater make-usb /dev/sda \
      --iso ~/orin-updater/jetsoninstaller-r39.2.1-2026-08-07-18-30-47-arm64-orin-updater.iso
 sudo ./orin-updater backup --usb           # 3. encrypted backup onto the key (asks a passphrase)
+sudo ./orin-updater verify-backup --usb    # 4. confirm it is complete BEFORE rebooting into the installer
 ```
 
 Then reboot with the key plugged in:
@@ -80,6 +81,11 @@ Then reboot with the key plugged in:
    login screen.
 5. Review `~/orin-updater-inventory/reinstall.sh`, then `sudo apt install nvidia-jetpack` for
    CUDA/TensorRT.
+
+If `backup` fails or is interrupted (freeze, power cut, Ctrl-C), the backup directory keeps an
+`INCOMPLETE` marker and the restore will refuse it. **Do not start the installation from that key.**
+Run `backup` again: it discards the unfinished attempt itself. `verify-backup` re-checks the
+sizes and sha256 of every part without the passphrase.
 
 Do the steps in that order, make-usb before backup: the backup is the last thing you do on the
 old system, so it is as fresh as possible. Close your applications first.
@@ -123,7 +129,10 @@ In short:
 * **The install wipes the target disk.** Keep a second copy of anything precious on another
   medium. `sudo ./orin-updater backup --out /some/other/disk` produces the same backup anywhere.
 * The backup is checked right after creation (decrypt + list), and every part's sha256 is checked
-  during restore.
+  during restore. An unfinished backup carries an `INCOMPLETE` marker that the restore refuses.
+* For a large home, also keep a copy on a second medium. A backup on the install key is
+  the only copy of your account on that key, and the key is the medium most likely to fail
+  during a long write.
 * `make-usb` refuses non-USB disks and disks that hold system mounts. It also asks you to type
   the device name.
 * Rollback: reinstall JetPack 6 (SDK Manager or NVIDIA's SD image/ISO), then run
